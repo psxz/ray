@@ -40,10 +40,7 @@ class ObjectBufferPool {
   /// \param store_socket_name The socket name of the store to which plasma clients
   /// connect.
   /// \param chunk_size The chunk size into which objects are to be split.
-  /// \param release_delay The number of release calls before objects are released
-  /// from the store client (FIFO).
-  ObjectBufferPool(const std::string &store_socket_name, const uint64_t chunk_size,
-                   const int release_delay);
+  ObjectBufferPool(const std::string &store_socket_name, const uint64_t chunk_size);
 
   ~ObjectBufferPool();
 
@@ -128,6 +125,11 @@ class ObjectBufferPool {
   /// \param object_ids the The list of ObjectIDs to be deleted.
   /// \return Void.
   void FreeObjects(const std::vector<ObjectID> &object_ids);
+
+  /// Returns debug string for class.
+  ///
+  /// \return string.
+  std::string DebugString() const;
 
  private:
   /// Abort the create operation associated with an object. This destroys the buffer

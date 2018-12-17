@@ -3,22 +3,30 @@ from __future__ import division
 from __future__ import print_function
 
 import collections
+import json
 import random
 import numpy as np
 import os
 import pytest
+import signal
 import sys
 import time
 
 import ray
 import ray.ray_constants as ray_constants
 import ray.test.test_utils
+import ray.test.cluster_utils
 
 
 @pytest.fixture
 def ray_start_regular():
     # Start the Ray processes.
-    ray.init(num_cpus=1)
+    ray.init(
+        num_cpus=1,
+        _internal_config=json.dumps({
+            "initial_reconstruction_timeout_milliseconds": 200,
+            "num_heartbeats_timeout": 10,
+        }))
     yield None
     # The code after the yield will run as teardown code.
     ray.shutdown()
@@ -29,6 +37,23 @@ def shutdown_only():
     yield None
     # The code after the yield will run as teardown code.
     ray.shutdown()
+
+
+@pytest.fixture
+def head_node_cluster():
+    cluster = ray.test.cluster_utils.Cluster(
+        initialize_head=True,
+        connect=True,
+        head_node_args={
+            "_internal_config": json.dumps({
+                "initial_reconstruction_timeout_milliseconds": 200,
+                "num_heartbeats_timeout": 10,
+            })
+        })
+    yield cluster
+    # The code after the yield will run as teardown code.
+    ray.shutdown()
+    cluster.shutdown()
 
 
 def test_actor_init_error_propagated(ray_start_regular):
@@ -718,7 +743,7 @@ def test_actor_load_balancing(shutdown_only):
     num_local_schedulers = 3
     ray.worker._init(
         start_ray_local=True,
-        num_workers=0,
+        num_cpus=1,
         num_local_schedulers=num_local_schedulers)
 
     @ray.remote
@@ -764,7 +789,6 @@ def test_actor_gpus(shutdown_only):
     num_gpus_per_scheduler = 4
     ray.worker._init(
         start_ray_local=True,
-        num_workers=0,
         num_local_schedulers=num_local_schedulers,
         num_cpus=(num_local_schedulers * [10 * num_gpus_per_scheduler]),
         num_gpus=(num_local_schedulers * [num_gpus_per_scheduler]))
@@ -807,7 +831,6 @@ def test_actor_multiple_gpus(shutdown_only):
     num_gpus_per_scheduler = 5
     ray.worker._init(
         start_ray_local=True,
-        num_workers=0,
         num_local_schedulers=num_local_schedulers,
         num_cpus=(num_local_schedulers * [10 * num_gpus_per_scheduler]),
         num_gpus=(num_local_schedulers * [num_gpus_per_scheduler]))
@@ -878,7 +901,6 @@ def test_actor_different_numbers_of_gpus(shutdown_only):
     # numbers of GPUs.
     ray.worker._init(
         start_ray_local=True,
-        num_workers=0,
         num_local_schedulers=3,
         num_cpus=[10, 10, 10],
         num_gpus=[0, 5, 10])
@@ -915,21 +937,23 @@ def test_actor_different_numbers_of_gpus(shutdown_only):
 
 
 def test_actor_multiple_gpus_from_multiple_tasks(shutdown_only):
-    num_local_schedulers = 10
-    num_gpus_per_scheduler = 10
+    num_local_schedulers = 5
+    num_gpus_per_scheduler = 5
     ray.worker._init(
         start_ray_local=True,
-        num_workers=0,
         num_local_schedulers=num_local_schedulers,
         redirect_output=True,
         num_cpus=(num_local_schedulers * [10 * num_gpus_per_scheduler]),
-        num_gpus=(num_local_schedulers * [num_gpus_per_scheduler]))
+        num_gpus=(num_local_schedulers * [num_gpus_per_scheduler]),
+        _internal_config=json.dumps({
+            "num_heartbeats_timeout": 1000
+        }))
 
     @ray.remote
-    def create_actors(n):
+    def create_actors(i, n):
         @ray.remote(num_gpus=1)
         class Actor(object):
-            def __init__(self):
+            def __init__(self, i, j):
                 self.gpu_ids = ray.get_gpu_ids()
 
             def get_location_and_ids(self):
@@ -937,14 +961,43 @@ def test_actor_multiple_gpus_from_multiple_tasks(shutdown_only):
                     ray.worker.global_worker.plasma_client.store_socket_name),
                         tuple(self.gpu_ids))
 
-        # Create n actors.
-        for _ in range(n):
-            Actor.remote()
+            def sleep(self):
+                time.sleep(100)
 
-    ray.get([
-        create_actors.remote(num_gpus_per_scheduler)
-        for _ in range(num_local_schedulers)
+        # Create n actors.
+        actors = []
+        for j in range(n):
+            actors.append(Actor.remote(i, j))
+
+        locations = ray.get(
+            [actor.get_location_and_ids.remote() for actor in actors])
+
+        # Put each actor to sleep for a long time to prevent them from getting
+        # terminated.
+        for actor in actors:
+            actor.sleep.remote()
+
+        return locations
+
+    all_locations = ray.get([
+        create_actors.remote(i, num_gpus_per_scheduler)
+        for i in range(num_local_schedulers)
     ])
+
+    # Make sure that no two actors are assigned to the same GPU.
+    node_names = {
+        location
+        for locations in all_locations for location, gpu_id in locations
+    }
+    assert len(node_names) == num_local_schedulers
+
+    # Keep track of which GPU IDs are being used for each location.
+    gpus_in_use = {node_name: [] for node_name in node_names}
+    for locations in all_locations:
+        for location, gpu_ids in locations:
+            gpus_in_use[location].extend(gpu_ids)
+    for node_name in node_names:
+        assert len(set(gpus_in_use[node_name])) == num_gpus_per_scheduler
 
     @ray.remote(num_gpus=1)
     class Actor(object):
@@ -968,7 +1021,6 @@ def test_actors_and_tasks_with_gpus(shutdown_only):
     num_gpus_per_scheduler = 6
     ray.worker._init(
         start_ray_local=True,
-        num_workers=0,
         num_local_schedulers=num_local_schedulers,
         num_cpus=num_gpus_per_scheduler,
         num_gpus=(num_local_schedulers * [num_gpus_per_scheduler]))
@@ -992,7 +1044,7 @@ def test_actors_and_tasks_with_gpus(shutdown_only):
     @ray.remote(num_gpus=1)
     def f1():
         t1 = time.monotonic()
-        time.sleep(0.1)
+        time.sleep(0.2)
         t2 = time.monotonic()
         gpu_ids = ray.get_gpu_ids()
         assert len(gpu_ids) == 1
@@ -1003,7 +1055,7 @@ def test_actors_and_tasks_with_gpus(shutdown_only):
     @ray.remote(num_gpus=2)
     def f2():
         t1 = time.monotonic()
-        time.sleep(0.1)
+        time.sleep(0.2)
         t2 = time.monotonic()
         gpu_ids = ray.get_gpu_ids()
         assert len(gpu_ids) == 2
@@ -1231,11 +1283,8 @@ def test_blocking_actor_task(shutdown_only):
     assert remaining_ids == [x_id]
 
 
-@pytest.mark.skipif(
-    os.environ.get("RAY_USE_XRAY") != "1",
-    reason="This test only works with xray.")
-def test_exception_raised_when_actor_node_dies(shutdown_only):
-    ray.worker._init(start_ray_local=True, num_local_schedulers=2, num_cpus=1)
+def test_exception_raised_when_actor_node_dies(head_node_cluster):
+    remote_node = head_node_cluster.add_node()
 
     @ray.remote
     class Counter(object):
@@ -1249,155 +1298,89 @@ def test_exception_raised_when_actor_node_dies(shutdown_only):
             self.x += 1
             return self.x
 
-    local_plasma = ray.worker.global_worker.plasma_client.store_socket_name
-
     # Create an actor that is not on the local scheduler.
     actor = Counter.remote()
-    while ray.get(actor.local_plasma.remote()) == local_plasma:
+    while (ray.get(actor.local_plasma.remote()) !=
+           remote_node.get_plasma_store_name()):
         actor = Counter.remote()
 
-    # Kill the second plasma store to get rid of the cached objects and
-    # trigger the corresponding local scheduler to exit.
-    process = ray.services.all_processes[
-        ray.services.PROCESS_TYPE_PLASMA_STORE][1]
-    process.kill()
+    # Kill the second node.
+    head_node_cluster.remove_node(remote_node)
 
-    # Submit some new actor tasks.
-    x_ids = [actor.inc.remote() for _ in range(100)]
-
-    # Make sure that getting the result raises an exception.
+    # Submit some new actor tasks both before and after the node failure is
+    # detected. Make sure that getting the result raises an exception.
     for _ in range(10):
+        # Submit some new actor tasks.
+        x_ids = [actor.inc.remote() for _ in range(5)]
         for x_id in x_ids:
-            with pytest.raises(ray.worker.RayGetError):
+            with pytest.raises(ray.worker.RayTaskError):
                 # There is some small chance that ray.get will actually
                 # succeed (if the object is transferred before the raylet
                 # dies).
                 ray.get(x_id)
 
-    # Make sure the process has exited.
-    process.wait()
 
-
-@pytest.mark.skipif(
-    os.environ.get("RAY_USE_XRAY") == "1",
-    reason="This test does not work with xray yet.")
 @pytest.mark.skipif(
     os.environ.get("RAY_USE_NEW_GCS") == "on",
     reason="Hanging with new GCS API.")
-def test_local_scheduler_dying(shutdown_only):
-    ray.worker._init(
-        start_ray_local=True,
-        num_local_schedulers=2,
-        num_workers=0,
-        redirect_output=True)
+def test_actor_init_fails(head_node_cluster):
+    remote_node = head_node_cluster.add_node()
 
-    @ray.remote
+    @ray.remote(max_reconstructions=1)
     class Counter(object):
         def __init__(self):
             self.x = 0
-
-        def local_plasma(self):
-            return ray.worker.global_worker.plasma_client.store_socket_name
 
         def inc(self):
             self.x += 1
             return self.x
 
-    local_plasma = ray.worker.global_worker.plasma_client.store_socket_name
-
-    # Create an actor that is not on the local scheduler.
-    actor = Counter.remote()
-    while ray.get(actor.local_plasma.remote()) == local_plasma:
-        actor = Counter.remote()
-
-    ids = [actor.inc.remote() for _ in range(100)]
-
-    # Wait for the last task to finish running.
-    ray.get(ids[-1])
-
-    # Kill the second plasma store to get rid of the cached objects and
-    # trigger the corresponding local scheduler to exit.
-    process = ray.services.all_processes[
-        ray.services.PROCESS_TYPE_PLASMA_STORE][1]
-    process.kill()
-    process.wait()
+    # Create many actors. It should take a while to finish initializing them.
+    actors = [Counter.remote() for _ in range(100)]
+    # Allow some time to forward the actor creation tasks to the other node.
+    time.sleep(0.1)
+    # Kill the second node.
+    head_node_cluster.remove_node(remote_node)
 
     # Get all of the results
-    results = ray.get(ids)
+    results = ray.get([actor.inc.remote() for actor in actors])
+    assert results == [1 for actor in actors]
 
-    assert results == list(range(1, 1 + len(results)))
 
+def test_reconstruction_suppression(head_node_cluster):
+    num_local_schedulers = 10
+    worker_nodes = [
+        head_node_cluster.add_node() for _ in range(num_local_schedulers)
+    ]
 
-@pytest.mark.skipif(
-    os.environ.get("RAY_USE_XRAY") == "1",
-    reason="This test does not work with xray yet.")
-@pytest.mark.skipif(
-    os.environ.get("RAY_USE_NEW_GCS") == "on",
-    reason="Hanging with new GCS API.")
-def test_many_local_schedulers_dying(shutdown_only):
-    # This test can be made more stressful by increasing the numbers below.
-    # The total number of actors created will be
-    # num_actors_at_a_time * num_local_schedulers.
-    num_local_schedulers = 5
-    num_actors_at_a_time = 3
-    num_function_calls_at_a_time = 10
-
-    ray.worker._init(
-        start_ray_local=True,
-        num_local_schedulers=num_local_schedulers,
-        num_cpus=3,
-        redirect_output=True)
-
-    @ray.remote
-    class SlowCounter(object):
+    @ray.remote(max_reconstructions=1)
+    class Counter(object):
         def __init__(self):
             self.x = 0
 
-        def inc(self, duration):
-            time.sleep(duration)
+        def inc(self):
             self.x += 1
             return self.x
 
-    # Create some initial actors.
-    actors = [SlowCounter.remote() for _ in range(num_actors_at_a_time)]
+    @ray.remote
+    def inc(actor_handle):
+        return ray.get(actor_handle.inc.remote())
 
-    # Wait for the actors to start up.
-    time.sleep(1)
+    # Make sure all of the actors have started.
+    actors = [Counter.remote() for _ in range(20)]
+    ray.get([actor.inc.remote() for actor in actors])
 
-    # This is a mapping from actor handles to object IDs returned by
-    # methods on that actor.
-    result_ids = collections.defaultdict(lambda: [])
+    # Kill a node.
+    head_node_cluster.remove_node(worker_nodes[0])
 
-    # In a loop we are going to create some actors, run some methods, kill
-    # a local scheduler, and run some more methods.
-    for i in range(num_local_schedulers - 1):
-        # Create some actors.
-        actors.extend(
-            [SlowCounter.remote() for _ in range(num_actors_at_a_time)])
-        # Run some methods.
-        for j in range(len(actors)):
-            actor = actors[j]
-            for _ in range(num_function_calls_at_a_time):
-                result_ids[actor].append(actor.inc.remote(j**2 * 0.000001))
-        # Kill a plasma store to get rid of the cached objects and trigger
-        # exit of the corresponding local scheduler. Don't kill the first
-        # local scheduler since that is the one that the driver is
-        # connected to.
-        process = ray.services.all_processes[
-            ray.services.PROCESS_TYPE_PLASMA_STORE][i + 1]
-        process.kill()
-        process.wait()
-
-        # Run some more methods.
-        for j in range(len(actors)):
-            actor = actors[j]
-            for _ in range(num_function_calls_at_a_time):
-                result_ids[actor].append(actor.inc.remote(j**2 * 0.000001))
-
-    # Get the results and check that they have the correct values.
-    for _, result_id_list in result_ids.items():
-        results = list(range(1, len(result_id_list) + 1))
-        assert ray.get(result_id_list) == results
+    # Submit several tasks per actor. These should be randomly scheduled to the
+    # nodes, so that multiple nodes will detect and try to reconstruct the
+    # actor that died, but only one should succeed.
+    results = []
+    for _ in range(10):
+        results += [inc.remote(actor) for actor in actors]
+    # Make sure that we can get the results from the reconstructed actor.
+    results = ray.get(results)
 
 
 def setup_counter_actor(test_checkpoint=False,
@@ -1406,7 +1389,7 @@ def setup_counter_actor(test_checkpoint=False,
     ray.worker._init(
         start_ray_local=True,
         num_local_schedulers=2,
-        num_workers=0,
+        num_cpus=1,
         redirect_output=True)
 
     # Only set the checkpoint interval if we're testing with checkpointing.
@@ -1465,9 +1448,7 @@ def setup_counter_actor(test_checkpoint=False,
     return actor, ids
 
 
-@pytest.mark.skipif(
-    os.environ.get("RAY_USE_XRAY") == "1",
-    reason="This test does not work with xray yet.")
+@pytest.mark.skip("This test does not work yet.")
 @pytest.mark.skipif(
     os.environ.get("RAY_USE_NEW_GCS") == "on",
     reason="Hanging with new GCS API.")
@@ -1495,9 +1476,7 @@ def test_checkpointing(shutdown_only):
     assert num_inc_calls < x
 
 
-@pytest.mark.skipif(
-    os.environ.get("RAY_USE_XRAY") == "1",
-    reason="This test does not work with xray yet.")
+@pytest.mark.skip("This test does not work yet.")
 @pytest.mark.skipif(
     os.environ.get("RAY_USE_NEW_GCS") == "on",
     reason="Hanging with new GCS API.")
@@ -1526,9 +1505,7 @@ def test_remote_checkpoint(shutdown_only):
     assert x == 101
 
 
-@pytest.mark.skipif(
-    os.environ.get("RAY_USE_XRAY") == "1",
-    reason="This test does not work with xray yet.")
+@pytest.mark.skip("This test does not work yet.")
 @pytest.mark.skipif(
     os.environ.get("RAY_USE_NEW_GCS") == "on",
     reason="Hanging with new GCS API.")
@@ -1557,9 +1534,7 @@ def test_lost_checkpoint(shutdown_only):
     assert 5 < num_inc_calls
 
 
-@pytest.mark.skipif(
-    os.environ.get("RAY_USE_XRAY") == "1",
-    reason="This test does not work with xray yet.")
+@pytest.mark.skip("This test does not work yet.")
 @pytest.mark.skipif(
     os.environ.get("RAY_USE_NEW_GCS") == "on",
     reason="Hanging with new GCS API.")
@@ -1590,9 +1565,7 @@ def test_checkpoint_exception(shutdown_only):
         assert error["type"] == ray_constants.CHECKPOINT_PUSH_ERROR
 
 
-@pytest.mark.skipif(
-    os.environ.get("RAY_USE_XRAY") == "1",
-    reason="This test does not work with xray yet.")
+@pytest.mark.skip("This test does not work yet.")
 @pytest.mark.skipif(
     os.environ.get("RAY_USE_NEW_GCS") == "on",
     reason="Hanging with new GCS API.")
@@ -1662,9 +1635,7 @@ def test_distributed_handle(self):
     assert x == count + 1
 
 
-@pytest.mark.skipif(
-    os.environ.get("RAY_USE_XRAY") == "1",
-    reason="This test does not work with xray yet.")
+@pytest.mark.skip("This test does not work yet.")
 @pytest.mark.skipif(
     os.environ.get("RAY_USE_NEW_GCS") == "on",
     reason="Hanging with new GCS API.")
@@ -1752,7 +1723,7 @@ def _test_nondeterministic_reconstruction(num_forks, num_items_per_fork,
     ray.worker._init(
         start_ray_local=True,
         num_local_schedulers=2,
-        num_workers=0,
+        num_cpus=1,
         redirect_output=True)
 
     # Make a shared queue.
@@ -1821,9 +1792,7 @@ def _test_nondeterministic_reconstruction(num_forks, num_items_per_fork,
     assert queue == reconstructed_queue[:len(queue)]
 
 
-@pytest.mark.skipif(
-    os.environ.get("RAY_USE_XRAY") == "1",
-    reason="This test does not work with xray yet.")
+@pytest.mark.skip("This test does not work yet.")
 @pytest.mark.skipif(
     os.environ.get("RAY_USE_NEW_GCS") == "on",
     reason="Currently doesn't work with the new GCS.")
@@ -1859,9 +1828,6 @@ def setup_queue_actor():
     ray.shutdown()
 
 
-@pytest.mark.skipif(
-    os.environ.get("RAY_USE_XRAY") == "1",
-    reason="This test does not work with xray yet.")
 def test_fork(setup_queue_actor):
     queue = setup_queue_actor
 
@@ -1878,9 +1844,6 @@ def test_fork(setup_queue_actor):
         assert filtered_items == list(range(1))
 
 
-@pytest.mark.skipif(
-    os.environ.get("RAY_USE_XRAY") == "1",
-    reason="This test does not work with xray yet.")
 def test_fork_consistency(setup_queue_actor):
     queue = setup_queue_actor
 
@@ -1968,6 +1931,28 @@ def test_pickling_actor_handle(ray_start_regular):
     ray.get(new_f.method.remote())
 
 
+def test_pickled_actor_handle_call_in_method_twice(ray_start_regular):
+    @ray.remote
+    class Actor1(object):
+        def f(self):
+            return 1
+
+    @ray.remote
+    class Actor2(object):
+        def __init__(self, constructor):
+            self.actor = constructor()
+
+        def step(self):
+            ray.get(self.actor.f.remote())
+
+    a = Actor1.remote()
+
+    b = Actor2.remote(lambda: a)
+
+    ray.get(b.step.remote())
+    ray.get(b.step.remote())
+
+
 def test_register_and_get_named_actors(ray_start_regular):
     # TODO(heyucongtom): We should test this from another driver.
 
@@ -2036,7 +2021,7 @@ def test_custom_label_placement(shutdown_only):
     ray.worker._init(
         start_ray_local=True,
         num_local_schedulers=2,
-        num_workers=0,
+        num_cpus=2,
         resources=[{
             "CustomResource1": 2
         }, {
@@ -2067,11 +2052,7 @@ def test_custom_label_placement(shutdown_only):
 
 
 def test_creating_more_actors_than_resources(shutdown_only):
-    ray.init(
-        num_workers=0,
-        num_cpus=10,
-        num_gpus=2,
-        resources={"CustomResource1": 1})
+    ray.init(num_cpus=10, num_gpus=2, resources={"CustomResource1": 1})
 
     @ray.remote(num_gpus=1)
     class ResourceActor1(object):
@@ -2116,3 +2097,215 @@ def test_creating_more_actors_than_resources(shutdown_only):
         ray.wait([object_id])
 
     ray.get(results)
+
+
+def test_actor_eviction(shutdown_only):
+    @ray.remote
+    class Actor(object):
+        def __init__(self):
+            pass
+
+        def create_object(self, size):
+            return np.random.rand(size)
+
+    object_store_memory = 10**8
+    ray.init(
+        object_store_memory=object_store_memory,
+        _internal_config=json.dumps({
+            "initial_reconstruction_timeout_milliseconds": 200
+        }))
+
+    a = Actor.remote()
+    # Submit enough methods on the actor so that they exceed the size of the
+    # object store.
+    objects = []
+    num_objects = 20
+    for _ in range(num_objects):
+        obj = a.create_object.remote(object_store_memory // num_objects)
+        objects.append(obj)
+        # Get each object once to make sure each object gets created.
+        ray.get(obj)
+
+    # Get each object again. At this point, the earlier objects should have
+    # been evicted.
+    num_evicted, num_success = 0, 0
+    for obj in objects:
+        try:
+            ray.get(obj)
+            num_success += 1
+        except ray.worker.RayTaskError:
+            num_evicted += 1
+    # Some objects should have been evicted, and some should still be in the
+    # object store.
+    assert num_evicted > 0
+    assert num_success > 0
+
+
+def test_actor_reconstruction(ray_start_regular):
+    """Test actor reconstruction when actor process is killed."""
+
+    @ray.remote(max_reconstructions=1)
+    class ReconstructableActor(object):
+        """An actor that will be reconstructed at most once."""
+
+        def __init__(self):
+            self.value = 0
+
+        def increase(self):
+            self.value += 1
+            return self.value
+
+        def get_pid(self):
+            return os.getpid()
+
+    def kill_actor(actor):
+        """Kill actor process."""
+        pid = ray.get(actor.get_pid.remote())
+        os.kill(pid, signal.SIGKILL)
+        time.sleep(1)
+
+    actor = ReconstructableActor.remote()
+    # Call increase 3 times
+    for _ in range(3):
+        ray.get(actor.increase.remote())
+    # kill actor process
+    kill_actor(actor)
+    # Call increase again.
+    # Check that actor is reconstructed and value is 4.
+    assert ray.get(actor.increase.remote()) == 4
+    # kill actor process one more time.
+    kill_actor(actor)
+    # The actor has exceeded max reconstructions, and this task should fail.
+    with pytest.raises(ray.worker.RayTaskError):
+        ray.get(actor.increase.remote())
+
+    # Create another actor.
+    actor = ReconstructableActor.remote()
+    # Intentionlly exit the actor
+    actor.__ray_terminate__.remote()
+    # Check that the actor won't be reconstructed.
+    with pytest.raises(ray.worker.RayTaskError):
+        ray.get(actor.increase.remote())
+
+
+def test_actor_reconstruction_on_node_failure(head_node_cluster):
+    """Test actor reconstruction when node dies unexpectedly."""
+    cluster = head_node_cluster
+    max_reconstructions = 3
+    # Add a few nodes to the cluster.
+    # Use custom resource to make sure the actor is only created on worker
+    # nodes, not on the head node.
+    for _ in range(max_reconstructions + 2):
+        cluster.add_node(
+            resources={"a": 1},
+            _internal_config=json.dumps({
+                "initial_reconstruction_timeout_milliseconds": 200,
+                "num_heartbeats_timeout": 10,
+            }),
+        )
+
+    def kill_node(object_store_socket):
+        node_to_remove = None
+        for node in cluster.worker_nodes:
+            if object_store_socket == node.get_plasma_store_name():
+                node_to_remove = node
+        cluster.remove_node(node_to_remove)
+
+    @ray.remote(max_reconstructions=max_reconstructions, resources={"a": 1})
+    class MyActor(object):
+        def __init__(self):
+            self.value = 0
+
+        def increase(self):
+            self.value += 1
+            return self.value
+
+        def get_object_store_socket(self):
+            return ray.worker.global_worker.plasma_client.store_socket_name
+
+    actor = MyActor.remote()
+    # Call increase 3 times.
+    for _ in range(3):
+        ray.get(actor.increase.remote())
+
+    for i in range(max_reconstructions):
+        object_store_socket = ray.get(actor.get_object_store_socket.remote())
+        # Kill actor's node and the actor should be reconstructed
+        # on a different node.
+        kill_node(object_store_socket)
+        # Call increase again.
+        # Check that the actor is reconstructed and value is correct.
+        assert ray.get(actor.increase.remote()) == 4 + i
+        # Check that the actor is now on a different node.
+        assert object_store_socket != ray.get(
+            actor.get_object_store_socket.remote())
+
+    # kill the node again.
+    object_store_socket = ray.get(actor.get_object_store_socket.remote())
+    kill_node(object_store_socket)
+    # The actor has exceeded max reconstructions, and this task should fail.
+    with pytest.raises(ray.worker.RayTaskError):
+        ray.get(actor.increase.remote())
+
+
+def test_multiple_actor_reconstruction(head_node_cluster):
+    # This test can be made more stressful by increasing the numbers below.
+    # The total number of actors created will be
+    # num_actors_at_a_time * num_local_schedulers.
+    num_local_schedulers = 5
+    num_actors_at_a_time = 3
+    num_function_calls_at_a_time = 10
+
+    worker_nodes = [
+        head_node_cluster.add_node(
+            resources={"CPU": 3},
+            _internal_config=json.dumps({
+                "initial_reconstruction_timeout_milliseconds": 200,
+                "num_heartbeats_timeout": 10,
+            })) for _ in range(num_local_schedulers)
+    ]
+
+    @ray.remote(max_reconstructions=ray.ray_constants.INFINITE_RECONSTRUCTION)
+    class SlowCounter(object):
+        def __init__(self):
+            self.x = 0
+
+        def inc(self, duration):
+            time.sleep(duration)
+            self.x += 1
+            return self.x
+
+    # Create some initial actors.
+    actors = [SlowCounter.remote() for _ in range(num_actors_at_a_time)]
+
+    # Wait for the actors to start up.
+    time.sleep(1)
+
+    # This is a mapping from actor handles to object IDs returned by
+    # methods on that actor.
+    result_ids = collections.defaultdict(lambda: [])
+
+    # In a loop we are going to create some actors, run some methods, kill
+    # a local scheduler, and run some more methods.
+    for node in worker_nodes:
+        # Create some actors.
+        actors.extend(
+            [SlowCounter.remote() for _ in range(num_actors_at_a_time)])
+        # Run some methods.
+        for j in range(len(actors)):
+            actor = actors[j]
+            for _ in range(num_function_calls_at_a_time):
+                result_ids[actor].append(actor.inc.remote(j**2 * 0.000001))
+        # Kill a node.
+        head_node_cluster.remove_node(node)
+
+        # Run some more methods.
+        for j in range(len(actors)):
+            actor = actors[j]
+            for _ in range(num_function_calls_at_a_time):
+                result_ids[actor].append(actor.inc.remote(j**2 * 0.000001))
+
+    # Get the results and check that they have the correct values.
+    for _, result_id_list in result_ids.items():
+        results = list(range(1, len(result_id_list) + 1))
+        assert ray.get(result_id_list) == results

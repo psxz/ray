@@ -5,6 +5,7 @@ from __future__ import print_function
 import copy
 import hashlib
 import inspect
+import logging
 
 import ray.ray_constants as ray_constants
 import ray.signature
@@ -14,6 +15,8 @@ DEFAULT_REMOTE_FUNCTION_CPUS = 1
 DEFAULT_REMOTE_FUNCTION_NUM_RETURN_VALS = 1
 DEFAULT_REMOTE_FUNCTION_MAX_CALLS = 0
 
+logger = logging.getLogger(__name__)
+
 
 def compute_function_id(function):
     """Compute an function ID for a function.
@@ -22,7 +25,7 @@ def compute_function_id(function):
         func: The actual function.
 
     Returns:
-        This returns the function ID.
+        Raw bytes of the function id
     """
     function_id_hash = hashlib.sha1()
     # Include the function module and name in the hash.
@@ -39,8 +42,6 @@ def compute_function_id(function):
     # Compute the function ID.
     function_id = function_id_hash.digest()
     assert len(function_id) == ray_constants.ID_SIZE
-    function_id = ray.ObjectID(function_id)
-
     return function_id
 
 
@@ -72,7 +73,7 @@ class RemoteFunction(object):
         # TODO(rkn): We store the function ID as a string, so that
         # RemoteFunction objects can be pickled. We should undo this when
         # we allow ObjectIDs to be pickled.
-        self._function_id = compute_function_id(self._function).id()
+        self._function_id = compute_function_id(function)
         self._function_name = (
             self._function.__module__ + '.' + self._function.__name__)
         self._num_cpus = (DEFAULT_REMOTE_FUNCTION_CPUS
@@ -90,11 +91,7 @@ class RemoteFunction(object):
 
         # # Export the function.
         worker = ray.worker.get_global_worker()
-        if worker.mode == ray.worker.SCRIPT_MODE:
-            self._export()
-        elif worker.mode is None:
-            worker.cached_remote_functions_and_actors.append(
-                ("remote_function", self))
+        worker.function_actor_manager.export(self)
 
     def __call__(self, *args, **kwargs):
         raise Exception("Remote functions cannot be called directly. Instead "
@@ -103,9 +100,26 @@ class RemoteFunction(object):
 
     def remote(self, *args, **kwargs):
         """This runs immediately when a remote function is called."""
-        return self._submit(args=args, kwargs=kwargs)
+        return self._remote(args=args, kwargs=kwargs)
 
     def _submit(self,
+                args=None,
+                kwargs=None,
+                num_return_vals=None,
+                num_cpus=None,
+                num_gpus=None,
+                resources=None):
+        logger.warn(
+            "WARNING: _submit() is being deprecated. Please use _remote().")
+        return self._remote(
+            args=args,
+            kwargs=kwargs,
+            num_return_vals=num_return_vals,
+            num_cpus=num_cpus,
+            num_gpus=num_gpus,
+            resources=resources)
+
+    def _remote(self,
                 args=None,
                 kwargs=None,
                 num_return_vals=None,
@@ -141,9 +155,3 @@ class RemoteFunction(object):
             return object_ids[0]
         elif len(object_ids) > 1:
             return object_ids
-
-    def _export(self):
-        worker = ray.worker.get_global_worker()
-        worker.export_remote_function(
-            ray.ObjectID(self._function_id), self._function_name,
-            self._function, self._max_calls, self)

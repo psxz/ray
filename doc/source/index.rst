@@ -32,7 +32,7 @@ Example Use
 |  results = [f() for i in range(4)]             |  results = ray.get([f.remote() for i in range(4)]) |
 +------------------------------------------------+----------------------------------------------------+
 
-
+To launch a Ray cluster, either privately, on AWS, or on GCP, `follow these instructions <autoscaling.rst>`_.
 
 View the `codebase on GitHub`_.
 
@@ -42,6 +42,7 @@ Ray comes with libraries that accelerate deep learning and reinforcement learnin
 
 - `Tune`_: Scalable Hyperparameter Search
 - `RLlib`_: Scalable Reinforcement Learning
+- `Distributed Training <distributed_sgd.html>`__
 
 .. _`Tune`: tune.html
 .. _`RLlib`: rllib.html
@@ -64,6 +65,14 @@ Ray comes with libraries that accelerate deep learning and reinforcement learnin
    actors.rst
    using-ray-with-gpus.rst
    webui.rst
+   async_api.rst
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Cluster Usage
+
+   autoscaling.rst
+   using-ray-on-a-cluster.rst
 
 .. toctree::
    :maxdepth: 1
@@ -74,10 +83,11 @@ Ray comes with libraries that accelerate deep learning and reinforcement learnin
    tune-schedulers.rst
    tune-searchalg.rst
    tune-package-ref.rst
+   tune-examples.rst
 
 .. toctree::
    :maxdepth: 1
-   :caption: Ray RLlib
+   :caption: RLlib
 
    rllib.rst
    rllib-training.rst
@@ -89,8 +99,9 @@ Ray comes with libraries that accelerate deep learning and reinforcement learnin
 
 .. toctree::
    :maxdepth: 1
-   :caption: Pandas on Ray
+   :caption: Other Libraries
 
+   distributed_sgd.rst
    pandas_on_ray.rst
 
 .. toctree::
@@ -118,15 +129,7 @@ Ray comes with libraries that accelerate deep learning and reinforcement learnin
    plasma-object-store.rst
    resources.rst
    redis-memory-management.rst
-
-.. toctree::
-   :maxdepth: 1
-   :caption: Cluster Usage
-
-   autoscaling.rst
-   using-ray-on-a-cluster.rst
-   using-ray-on-a-large-cluster.rst
-   using-ray-and-docker-on-a-cluster.md
+   tempfile.rst
 
 .. toctree::
    :maxdepth: 1
@@ -134,6 +137,7 @@ Ray comes with libraries that accelerate deep learning and reinforcement learnin
 
    troubleshooting.rst
    user-profiling.rst
+   security.rst
    development.rst
    profiling.rst
    contact.rst

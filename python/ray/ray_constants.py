@@ -5,7 +5,7 @@ from __future__ import print_function
 
 import os
 
-import ray
+from ray.raylet import ObjectID
 
 
 def env_integer(key, default):
@@ -15,7 +15,7 @@ def env_integer(key, default):
 
 
 ID_SIZE = 20
-NIL_JOB_ID = ray.ObjectID(ID_SIZE * b"\xff")
+NIL_JOB_ID = ObjectID(ID_SIZE * b"\xff")
 
 # If a remote function or actor (or some other export) has serialized size
 # greater than this quantity, print an warning.
@@ -41,7 +41,6 @@ REGISTER_ACTOR_PUSH_ERROR = "register_actor"
 WORKER_CRASH_PUSH_ERROR = "worker_crash"
 WORKER_DIED_PUSH_ERROR = "worker_died"
 PUT_RECONSTRUCTION_PUSH_ERROR = "put_reconstruction"
-HASH_MISMATCH_PUSH_ERROR = "object_hash_mismatch"
 INFEASIBLE_TASK_ERROR = "infeasible_task"
 REMOVED_NODE_ERROR = "node_removed"
 MONITOR_DIED_ERROR = "monitor_died"
@@ -77,3 +76,8 @@ LOGGER_LEVEL = "info"
 LOGGER_LEVEL_CHOICES = ['debug', 'info', 'warning', 'error', 'critical']
 LOGGER_LEVEL_HELP = ("The logging level threshold, choices=['debug', 'info',"
                      " 'warning', 'error', 'critical'], default='info'")
+
+# A constant indicating that an actor doesn't need reconstructions.
+NO_RECONSTRUCTION = 0
+# A constant indicating that an actor should be reconstructed infinite times.
+INFINITE_RECONSTRUCTION = 2**30
